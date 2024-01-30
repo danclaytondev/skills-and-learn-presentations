@@ -1,0 +1,280 @@
+---
+title: "Databases, DuckDB + Parquet"
+author: "Dan Clayton"
+format: 
+    revealjs:
+        logo: static/logo.jpg
+        css: static/logo.css
+---
+
+## Background
+- OLAP type requirements are very common
+- Often first reach to Pandas or similar to do some analysis
+- Also common to have data pipelines to transform data, might scale beyond expectations
+- We might have a relational database (PostgreSQL etc) already running
+- Munching CSVs can be easy, or quite horrible
+
+## Common issues
+
+- Pandas is widely known, but API is generally poor, and it's slow (for large datasets)
+- I recently have been using Polars as a replacement
+- Spend a lot of time in the docs looking up functions
+
+## SQL?
+
+- I am fairly comfortable with SQL, so are many of us
+- Data manipulation can often be done quite expressively using SQL queries
+
+## sqlite as a wrangling/analysis tool
+- sqlite is the most deployed database, over $10^{12}$ instances easily
+- single file database, low barrier to import/export data
+- Gives you the power of SQL without the faff of Postgres, (still a bit of a faff?)
+
+## RDBMS
+
+- We might already have a Postgres instance with our data in, objectively very performant, but can still be slow for OLAP tasks and data transformation
+- Have to have our Postgres server running, limited by server resources if remote
+- Exploratory OLAP in prod is bad for your health
+
+## RDBMS
+
+- Postgres, MySQL and sqlite all store data row-oriented (tuples)
+- Good for transactions, slower for many OLAP tasks
+- Vectorised operations are much faster
+
+## Introducing DuckDB
+
+- RDBMS, table oriented, with strong SQL support
+- Runs as a single process, no dependencies or server
+- Feature rich, Postgres-like SQL support, with advanced SQL features vs. sqlite
+- Excellent at importing/exporting data
+
+## Using DuckDB
+
+- Demo 
+```sqlmysql
+CREATE TABLE weather (
+    city            VARCHAR,
+    temp_lo         INTEGER, -- minimum temperature on a day
+    temp_hi         INTEGER, -- maximum temperature on a day
+    precipitation   REAL,    -- mm 
+    date            DATE
+);
+```
+
+```sql
+INSERT INTO weather VALUES ('Liverpool',  13, 20, 0.0, '2023-06-24');
+INSERT INTO weather VALUES ('Manchester', 14, 21, 3.2, '2023-06-24');
+```
+
+## Working with CSVs - DuckDB
+
+- We can query CSVs like they're a SQL table
+
+```sql
+SELECT * FROM 'flights.csv';
+```
+
+- This is shorthand for
+```sql
+SELECT * FROM read_csv('flights.csv');
+```
+
+## CSV sniffing
+
+- This flights.csv looks like this:
+
+```
+FlightDate|UniqueCarrier|OriginCityName|DestCityName
+1988-01-01|AA|New York, NY|Los Angeles, CA
+1988-01-02|AA|New York, NY|Los Angeles, CA
+1988-01-03|AA|New York, NY|Los Angeles, CA
+```
+- Docs example because its non-standard
+
+## Movies dataset
+
+- 24 columns x 45k rows
+- This CSV isn't perfectly formatted
+```sql
+SELECT * FROM 'movies.csv' LIMIT 1;
+```
+-
+```sql
+SELECT tagline FROM 'movies.csv' LIMIT 10;
+```
+
+## Creating relations (tables) from csv
+```sql
+CREATE TABLE movies AS 
+    SELECT * FROM read_csv_auto(
+        'movies.csv',
+        ignore_errors=1, -- a few rows are malformatted, skip
+        dateformat='%x', -- ISO8601 date
+        types={
+            'release_date':'DATE',
+    	    'budget':'bigint'
+        }
+    );
+```
+
+## Vectorised Queries
+
+```sql
+SELECT
+	title,
+	revenue / budget AS factor
+FROM
+	movies
+WHERE
+	budget > 200000000
+ORDER BY
+	factor DESC
+LIMIT 10;
+```
+- Will run as a columnar-vectorised query
+- Benefits of vectorised operations and query planner
+
+## Remote Files
+- With the DuckDB httpfs/s3 extensions, you can query remote files
+```sql
+SELECT * FROM 's3://bucket/file.csv';
+```
+or
+```sql
+SELECT * FROM read_csv_auto(
+        'https://bucket-name.s3.eu-west-2.amazonaws.com/movies.csv',
+        ignore_errors=1, -- a few rows are malformatted, skip
+        dateformat='%x', -- ISO8601 date
+        types={
+            'release_date':'DATE',
+    	    'budget':'bigint'
+        }
+    );
+```
+
+## Integrations
+
+- Import/export very easily to
+  - JSON
+  - Postgres/MySQL server (live query table in another DB)
+  - Parquet
+  - S3 objects directly
+  - CSV/Excel
+  - sqlite
+
+## Client APIs
+- APIs for most good™ languages
+- Use DuckDB features in code, and efficient data transfer
+```python
+import duckdb
+
+duckdb.sql("SELECT 42").show()
+```
+
+## Magic APIs
+
+```python
+import duckdb
+
+# directly query a Pandas DataFrame
+import pandas as pd
+pandas_df = pd.DataFrame({"a": [42]})
+duckdb.sql("SELECT * FROM pandas_df")
+
+# directly query a Polars DataFrame
+import polars as pl
+polars_df = pl.DataFrame({"a": [42]})
+duckdb.sql("SELECT * FROM polars_df")
+```
+
+## Lazy SQL on Pandas
+
+```python
+import duckdb
+import pandas
+
+# connect to an in-memory database
+con = duckdb.connect()
+
+input_df = pandas.DataFrame.from_dict({
+    'i': [1, 2, 3, 4],
+    'j': ["one", "two", "three", "four"]
+})
+
+# create a DuckDB relation from a dataframe
+rel = con.from_df(input_df)
+
+# chain together relational operators 
+# (this is a lazy operation, so the operations are not yet executed)
+# equivalent to: 
+#    SELECT i, j, i*2 AS two_i FROM input_df ORDER BY i DESC LIMIT 2
+transformed_rel = rel.filter('i >= 2')
+		      .project('i, j, i*2 as two_i')
+		      .order('i desc')
+		      .limit(2)
+
+# trigger execution by requesting .df() of the relation
+# .df() could have been added to the end of the chain above - it was separated for clarity
+output_df = transformed_rel.df()
+```
+
+## Parquet
+
+- Column based data storage format
+- Open-source, top level Apache project
+- Relatively young (10 years) vs CSV (50y)
+- In the Hadoop ecosystem but used outside of it
+
+## Parquet
+
+- Stores data compressed on disk
+- Columns stored in contiguous blocks of memory
+  - You can skip over columns at no* IO cost
+- Compression of column data is more efficient (same datatypes)
+- Apache Arrow is an in-memory columnar data structure, that complements Parquet
+  - Pandas/Polars use Apache Arrow now
+
+## Parquet
+
+- Good for OLAP
+- Can ignore entire columns you don't need
+- Stores data as a proper datatype rather than all text (CSV)
+  - Not human readable
+  - Annoying if you end up with the wrong datatype
+  - More efficient than CSV
+- Metadata in the file
+  - Min/max values of groups of rows
+
+## Using with DuckDB
+
+- DuckDB has very strong Parquet support
+- Operate SQL queries directly on Parquet files
+- Reads files as a stream, can process out-of-memory datasets
+- Uses metadata to 'push down' queries onto Parquet
+  - Uses column AND row filters to only read data it needs to
+- Can query multiple files at the same time
+
+## 'Pushing down' queries
+
+- Only reading data you need saves disk IO... but also network!
+- Like CSV, DuckDB can read remote parquet files
+- By exploting the Parquet metadata and HTTP Range headers, network and disk IO is saved
+
+## Demo
+
+```sql
+SELECT *
+FROM 
+'https://bucket-name.s3.eu-west-2.amazonaws.com/movies.parquet';
+```
+_ 
+```sql
+SELECT avg(revenue)
+FROM 
+'https://bucket-name.s3.eu-west-2.amazonaws.com/movies.parquet';
+```
+
+## HTTP Range uses
+
+- [Protomaps](https://protomaps.com/)
